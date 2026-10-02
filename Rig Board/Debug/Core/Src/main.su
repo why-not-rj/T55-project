@@ -1,0 +1,17 @@
+../Core/Src/main.c:133:17:read_adc_channel	40	static
+../Core/Src/main.c:149:14:scale_clamped_0_1	32	static
+../Core/Src/main.c:167:14:process_pedal	24	static
+../Core/Src/main.c:181:12:classify_row	16	static
+../Core/Src/main.c:188:12:classify_col	16	static
+../Core/Src/main.c:195:16:compute_gear	24	static
+../Core/Src/main.c:218:5:main	400	static
+../Core/Src/main.c:358:6:SystemClock_Config	88	static
+../Core/Src/main.c:398:13:MX_ADC1_Init	24	static
+../Core/Src/main.c:428:13:MX_ADC3_Init	24	static
+../Core/Src/main.c:458:13:MX_TIM2_Init	56	static
+../Core/Src/main.c:490:13:MX_TIM3_Init	56	static
+../Core/Src/main.c:522:13:MX_USART3_UART_Init	8	static
+../Core/Src/main.c:540:13:MX_USB_OTG_FS_PCD_Init	8	static
+../Core/Src/main.c:558:13:MX_GPIO_Init	64	static
+../Core/Src/main.c:663:6:MPU_Config	24	static
+../Core/Src/main.c:685:6:Error_Handler	4	static,ignoring_inline_asm

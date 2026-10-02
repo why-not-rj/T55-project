@@ -1,0 +1,3 @@
+../Core/Src/udp_server.c:33:13:udp_server_recv	6
+../Core/Src/udp_server.c:83:6:udp_server_send_position	3
+../Core/Src/udp_server.c:116:6:udp_server_init	2

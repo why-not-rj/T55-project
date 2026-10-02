@@ -1,0 +1,13 @@
+../Core/Src/main.c:100:17:read_hall_channel	1
+../Core/Src/main.c:116:12:classify_row	3
+../Core/Src/main.c:123:12:classify_col	3
+../Core/Src/main.c:131:16:compute_gear	10
+../Core/Src/main.c:160:5:main	3
+../Core/Src/main.c:238:6:SystemClock_Config	4
+../Core/Src/main.c:296:13:MX_ADC1_Init	3
+../Core/Src/main.c:348:13:MX_ETH_Init	2
+../Core/Src/main.c:397:13:MX_USART3_UART_Init	2
+../Core/Src/main.c:432:13:MX_USB_OTG_FS_PCD_Init	2
+../Core/Src/main.c:467:13:MX_GPIO_Init	1
+../Core/Src/main.c:535:6:MPU_Config	1
+../Core/Src/main.c:566:6:Error_Handler	1

@@ -1,0 +1,697 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body for Sim Rig Controller (Merged)
+  *
+  * Merge notes:
+  *  - Encoder GPIO init (TIM2/TIM3) is now done explicitly inside
+  *    MX_GPIO_Init(), matching the verified-working test_2 configuration,
+  *    instead of relying solely on the MSP callback. This makes the pin
+  *    config visible and self-documenting in one place, and avoids the
+  *    "silently correct only because of a comment-stripped MSP file" trap.
+  *  - stm32f7xx_hal_msp.c should still exist and match: TIM2 -> PA15/PB3,
+  *    TIM3 -> PA6/PC7 (AF1_TIM2 / AF2_TIM3). Keep them in sync.
+  *  - Fixed the right/left stick scaling swap that was in rig board:
+  *    encoder_position (TIM2/Left) now feeds left_stick_scaled,
+  *    encoder2_position (TIM3/Right) now feeds right_stick_scaled.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "lwip.h"
+#include <stdlib.h>
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "udp_server.h"
+#include <stdio.h>
+#include <Tle5012b.h>
+/* USER CODE END Includes */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define ACCEL_ADC_MIN     3740
+#define ACCEL_ADC_MAX     260
+
+#define BRAKE_ADC_MIN     3720
+#define BRAKE_ADC_MAX     1150
+
+#define CLUTCH_ADC_MIN    3720
+#define CLUTCH_ADC_MAX    300
+
+#define RIGHT_STICK_MIN   0
+#define RIGHT_STICK_MAX   -475
+
+#define LEFT_STICK_MIN    0
+#define LEFT_STICK_MAX    490
+/* USER CODE END PD */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc3;
+
+UART_HandleTypeDef huart3;
+PCD_HandleTypeDef hpcd_USB_OTG_FS;
+
+TIM_HandleTypeDef htim2; // Left encoder
+TIM_HandleTypeDef htim3; // Right encoder
+
+/* USER CODE BEGIN PV */
+/* Global Variables exported to UDP/System */
+volatile int32_t current_gear = 0;
+volatile int32_t encoder_position = 0;  // Left  (TIM2)
+volatile int32_t encoder2_position = 0; // Right (TIM3)
+
+volatile int32_t accelerator_position = 0;
+volatile int32_t brake_position = 0;
+volatile int32_t clutch_position = 0;
+
+volatile int32_t button_state = 0; // 0 = Released, 1 = Pressed
+
+volatile float right_stick_scaled = 0.0f;
+volatile float left_stick_scaled  = 0.0f;
+volatile float accelerator_scaled = 0.0f;
+volatile float brake_scaled       = 0.0f;
+volatile float clutch_scaled      = 0.0f;
+volatile float min_clutch_pressed = 0.8f;
+
+uint32_t H1_ADC = 0;
+uint32_t H2_ADC = 0;
+
+/* Internal Loop State Variables */
+static uint32_t last_tick_ms = 0;
+static uint32_t last_led_tick_ms = 0;
+static uint32_t last_uart_tick_ms = 0;
+
+static uint16_t last_timer = 0;
+static uint16_t last_timer2 = 0;
+
+static uint32_t accel_filtered = 0;
+static uint32_t brake_filtered = 0;
+static uint32_t clutch_filtered = 0;
+
+static uint32_t h1_filtered = 0, h2_filtered = 0;
+
+static uint8_t accel_filter_init = 0;
+static uint8_t brake_filter_init = 0;
+static uint8_t clutch_filter_init = 0;
+static uint8_t  h1_filter_init = 0, h2_filter_init = 0;
+
+static int32_t last_valid_gear = 0;
+static int32_t last_requested_gear = 0;
+
+static uint32_t h_fused = 0;
+
+
+
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MPU_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_ADC3_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_USB_OTG_FS_PCD_Init(void);
+
+/* USER CODE BEGIN PFP */
+static uint32_t read_adc_channel(ADC_HandleTypeDef *hadc, uint32_t channel);
+static float scale_clamped_0_1(int32_t value, int32_t min_val, int32_t max_val);
+static float process_pedal(uint32_t raw_adc, uint32_t *filtered, uint8_t *filter_init,
+                           int32_t min_val, int32_t max_val, int32_t *raw_out);
+static int32_t compute_gear(float x_raw, int32_t y_raw);
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 0 */
+static uint32_t read_adc_channel(ADC_HandleTypeDef *hadc, uint32_t channel)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_56CYCLES;
+    HAL_ADC_ConfigChannel(hadc, &sConfig);
+
+    HAL_ADC_Start(hadc);
+    HAL_ADC_PollForConversion(hadc, 10);
+    uint32_t raw = HAL_ADC_GetValue(hadc);
+    HAL_ADC_Stop(hadc);
+
+    return raw;
+}
+
+static float scale_clamped_0_1(int32_t value, int32_t min_val, int32_t max_val)
+{
+    if (min_val == max_val) return 0.0f;
+
+    float norm;
+    if (min_val < max_val) {
+        if (value < min_val) value = min_val;
+        if (value > max_val) value = max_val;
+        norm = (float)(value - min_val) / (float)(max_val - min_val);
+    } else {
+        if (value > min_val) value = min_val;
+        if (value < max_val) value = max_val;
+        norm = (float)(min_val - value) / (float)(min_val - max_val);
+    }
+
+    return norm;
+}
+
+static float process_pedal(uint32_t raw_adc, uint32_t *filtered, uint8_t *filter_init,
+                           int32_t min_val, int32_t max_val, int32_t *raw_out)
+{
+    if (!(*filter_init)) {
+        *filtered = raw_adc;
+        *filter_init = 1;
+    } else {
+        *filtered = *filtered + ((int32_t)raw_adc - (int32_t)(*filtered)) / 3;
+    }
+
+    *raw_out = (int32_t)(*filtered);
+    return scale_clamped_0_1(*raw_out, min_val, max_val);
+}
+
+static int classify_row(int32_t y)
+{
+    if (y < -1500) return -1;      /* top (front) */
+    else if (y > 1500) return 1;  /* neutral */
+    else return 0;                 /* bottom (back) */
+}
+
+static int classify_col(float x)
+{
+    if (x < -58.0f) return -1;    /* left */
+    else if (x < -48.0f) return 0;/* center */
+    else return 1;                 /* right */
+}
+
+static int32_t compute_gear(float x_raw, int32_t y_raw)
+{
+    int col = classify_col(x_raw);
+    int row = classify_row(y_raw);
+
+    if (row == 0) return 0;
+
+    if (row == -1) {
+        if (col == -1) return 3;
+        if (col == 0)  return 6;
+        if (col == 1)  return 4;
+    }
+
+    if (row == 1) {
+        if (col == -1) return 2;
+        if (col == 0)  return 1;
+        if (col == 1)  return 5;
+    }
+
+    return 0;
+}
+/* USER CODE END 0 */
+
+int main(void)
+{
+  TLE5012_Frame_t frame;
+  float angle_deg = 0.0f;
+
+  MPU_Config();
+  HAL_Init();
+  SystemClock_Config();
+
+  /* Peripheral Initialization */
+  MX_GPIO_Init();
+  MX_ADC1_Init();
+  MX_ADC3_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
+  MX_USART3_UART_Init();
+  MX_USB_OTG_FS_PCD_Init();
+  MX_LWIP_Init();
+
+  HAL_Delay(500);
+
+
+
+
+  /* Start Hardware Timers for Quadrature Encoders */
+  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL); // Left
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL); // Right
+  last_timer  = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+  last_timer2 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+
+  /* Initialize Communication and Driver Peripherals */
+  udp_server_init();
+  TLE5012_GPIO_Init();
+
+  uint32_t init_tick = HAL_GetTick();
+  last_tick_ms      = init_tick;
+  last_led_tick_ms  = init_tick;
+  last_uart_tick_ms = init_tick;
+
+  while (1)
+  {
+      MX_LWIP_Process();
+      uint32_t now = HAL_GetTick();
+
+      /* 1. Heartbeat LED (500ms Period) */
+      if ((now - last_led_tick_ms) >= 500) {
+          HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+          last_led_tick_ms = now;
+      }
+
+      /* 2. Main Input Sampling Loop (10ms / 100Hz Rate) */
+      if ((now - last_tick_ms) >= 10)
+      {
+          last_tick_ms = now;
+
+          /* Sample Push Button State on PD15 (Active Low: 0 when pressed) */
+          button_state = (HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_15) == GPIO_PIN_RESET) ? 1 : 0;
+
+          /* Left Encoder (TIM2) Accumulation */
+          uint16_t current_timer = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+          encoder_position += (int16_t)(current_timer - last_timer);
+          last_timer = current_timer;
+
+          /* Right Encoder (TIM3) Accumulation */
+          uint16_t current_timer2 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+          encoder2_position += (int16_t)(current_timer2 - last_timer2);
+          last_timer2 = current_timer2;
+
+          /* Pedal ADC Sampling */
+          accelerator_scaled = process_pedal(read_adc_channel(&hadc3, ADC_CHANNEL_8),
+                                             &accel_filtered, &accel_filter_init,
+                                             ACCEL_ADC_MIN, ACCEL_ADC_MAX,
+                                             (int32_t*)&accelerator_position);
+
+          brake_scaled       = process_pedal(read_adc_channel(&hadc3, ADC_CHANNEL_9),
+                                             &brake_filtered, &brake_filter_init,
+                                             BRAKE_ADC_MIN, BRAKE_ADC_MAX,
+                                             (int32_t*)&brake_position);
+
+          clutch_scaled      = process_pedal(read_adc_channel(&hadc1, ADC_CHANNEL_4),
+                                             &clutch_filtered, &clutch_filter_init,
+                                             CLUTCH_ADC_MIN, CLUTCH_ADC_MAX,
+                                             (int32_t*)&clutch_position);
+
+          /* Encoder Normalization -- FIXED: correct source variable per side */
+          left_stick_scaled  = scale_clamped_0_1(encoder_position,  LEFT_STICK_MIN,  LEFT_STICK_MAX);  // TIM2 = Left
+          right_stick_scaled = scale_clamped_0_1(encoder2_position, RIGHT_STICK_MIN, RIGHT_STICK_MAX); // TIM3 = Right
+
+          /* Gearbox Hall Sensors */
+          H1_ADC = read_adc_channel(&hadc1, ADC_CHANNEL_3);
+          H2_ADC = read_adc_channel(&hadc1, ADC_CHANNEL_10);
+
+          if (!h1_filter_init) { h1_filtered = H1_ADC; h1_filter_init = 1; }
+          else { h1_filtered = h1_filtered + ((int32_t)H1_ADC - (int32_t)h1_filtered) / 3; }
+
+          if (!h2_filter_init) { h2_filtered = H2_ADC; h2_filter_init = 1; }
+          else { h2_filtered = h2_filtered + ((int32_t)H2_ADC - (int32_t)h2_filtered) / 3; }
+
+          h_fused = (uint32_t)(h1_filtered - h2_filtered);
+
+          /* TLE5012 Shift Angle Decoding */
+          if (TLE5012_ReadAngleDeg(&angle_deg, &frame) == HAL_OK && frame.crc_ok) {
+              int32_t requested_gear = compute_gear(angle_deg, h_fused);
+
+              if (requested_gear != last_requested_gear){
+            	  if (clutch_scaled >= min_clutch_pressed) {
+            		  last_valid_gear = requested_gear;
+            	  }
+            	  last_requested_gear = requested_gear;
+          }
+              current_gear = last_valid_gear;
+          }
+          else {
+              current_gear = last_valid_gear;
+          }
+
+          udp_server_send_position();
+      }
+
+      /* 3. Debug Output via UART3 (200ms Rate) */
+      if ((now - last_uart_tick_ms) >= 200) {
+          last_uart_tick_ms = now;
+          char dbg[220];
+          int dbg_len = snprintf(dbg, sizeof(dbg),
+              "Acc:%.2f (Raw:%ld) Brk:%.2f (Raw:%ld) Clt:%.2f (Raw:%ld) "
+              "H1:%lu H2:%lu h_fused:%ld Angle:%.2f Gear:%ld RT:%.2f (Raw2:%ld) LT:%.2f (Raw:%ld) Btn:%u\r\n\r\n",
+              accelerator_scaled, accelerator_position,
+              brake_scaled, brake_position,
+              clutch_scaled, clutch_position,
+              H1_ADC, H2_ADC, h_fused, angle_deg, current_gear,
+              right_stick_scaled, encoder2_position,
+              left_stick_scaled, encoder_position, button_state);
+          HAL_UART_Transmit(&huart3, (uint8_t*)dbg, dbg_len, 50);
+      }
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 216;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 9;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+
+  // Retry indefinitely (or with a generous cap) until the external MCO/HSE is actually present
+  while (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+      HAL_Delay(5); // safe: still running off default HSI here
+  }
+
+  if (HAL_PWREx_EnableOverDrive() != HAL_OK) { Error_Handler(); }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  while (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK)
+  {
+      HAL_Delay(5);
+  }
+}
+
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV6;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_ADC3_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc3.Instance = ADC3;
+  hadc3.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV6;
+  hadc3.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc3.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc3.Init.ContinuousConvMode = DISABLE;
+  hadc3.Init.DiscontinuousConvMode = DISABLE;
+  hadc3.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc3.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc3.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc3.Init.NbrOfConversion = 1;
+  hadc3.Init.DMAContinuousRequests = DISABLE;
+  hadc3.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_TIM2_Init(void)
+{
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 65535;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_TIM3_Init(void)
+{
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_USART3_UART_Init(void)
+{
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_USB_OTG_FS_PCD_Init(void)
+{
+  hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
+  hpcd_USB_OTG_FS.Init.dev_endpoints = 6;
+  hpcd_USB_OTG_FS.Init.speed = PCD_SPEED_FULL;
+  hpcd_USB_OTG_FS.Init.dma_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
+  hpcd_USB_OTG_FS.Init.Sof_enable = ENABLE;
+  hpcd_USB_OTG_FS.Init.low_power_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.lpm_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.vbus_sensing_enable = ENABLE;
+  hpcd_USB_OTG_FS.Init.use_dedicated_ep1 = DISABLE;
+  if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOB, LD1_Pin|LD3_Pin|LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
+
+  /* Configure PD15 as Input with Internal Pull-Up for Push Button */
+  GPIO_InitStruct.Pin = GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = USER_Btn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = LD1_Pin|LD3_Pin|LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_14;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(USB_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = USB_OverCurrent_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+  /* Analog inputs: Clutch PA4 (ADC1_IN4), H1 PA3 (ADC1_IN3) */
+  GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* Analog input: H2 PC0 (ADC1_IN10) */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* Analog inputs: Accelerator PF10 (ADC3_IN8), Brake PF3 (ADC3_IN9) */
+  GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+
+  /* ================================================================ */
+  /* ENCODER PINS — explicit here so config is visible in one place.  */
+  /* MUST match stm32f7xx_hal_msp.c's HAL_TIM_Encoder_MspInit()!      */
+  /* TIM3 (Right): PA6 = CH1, PC7 = CH2, AF2_TIM3                     */
+  /* TIM2 (Left):  PA15 = CH1, PB3 = CH2, AF1_TIM2                    */
+  /* ================================================================ */
+
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+}
+
+void MPU_Config(void)
+{
+  MPU_Region_InitTypeDef MPU_InitStruct = {0};
+
+  HAL_MPU_Disable();
+
+  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+  MPU_InitStruct.Number = MPU_REGION_NUMBER0;
+  MPU_InitStruct.BaseAddress = 0x0;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
+  MPU_InitStruct.SubRegionDisable = 0x87;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
+  MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif

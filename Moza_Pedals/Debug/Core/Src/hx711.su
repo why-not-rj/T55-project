@@ -1,0 +1,5 @@
+../Core/Src/hx711.c:28:20:hx711_delay	16	static,ignoring_inline_asm
+../Core/Src/hx711.c:35:6:HX711_Init	32	static
+../Core/Src/hx711.c:55:9:HX711_IsReady	4	static
+../Core/Src/hx711.c:61:9:HX711_ReadRaw	24	static
+../Core/Src/hx711.c:96:9:HX711_ReadMedian	96	static

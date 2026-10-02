@@ -1,0 +1,13 @@
+../Core/Src/Tle5102b.c:42:20:DATA_DirOutput	1
+../Core/Src/Tle5102b.c:47:20:DATA_DirInput	1
+../Core/Src/Tle5102b.c:59:13:DWT_Init	1
+../Core/Src/Tle5102b.c:77:20:bit_delay	3
+../Core/Src/Tle5102b.c:102:6:TLE5012_GPIO_Init	2
+../Core/Src/Tle5102b.c:144:13:WriteBit	2
+../Core/Src/Tle5102b.c:154:16:ReadBit	2
+../Core/Src/Tle5102b.c:165:13:WriteWord	2
+../Core/Src/Tle5102b.c:172:17:ReadWord	2
+../Core/Src/Tle5102b.c:187:16:TLE5012_CRC8	4
+../Core/Src/Tle5102b.c:207:19:TLE5012_ReadRegister	4
+../Core/Src/Tle5102b.c:254:7:TLE5012_ConvertAngleDeg	1
+../Core/Src/Tle5102b.c:261:19:TLE5012_ReadAngleDeg	4

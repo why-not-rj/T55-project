@@ -1,0 +1,17 @@
+../Core/Src/main.c:133:17:read_adc_channel	1
+../Core/Src/main.c:149:14:scale_clamped_0_1	7
+../Core/Src/main.c:167:14:process_pedal	2
+../Core/Src/main.c:181:12:classify_row	3
+../Core/Src/main.c:188:12:classify_col	3
+../Core/Src/main.c:195:16:compute_gear	10
+../Core/Src/main.c:218:5:main	10
+../Core/Src/main.c:358:6:SystemClock_Config	4
+../Core/Src/main.c:398:13:MX_ADC1_Init	3
+../Core/Src/main.c:428:13:MX_ADC3_Init	3
+../Core/Src/main.c:458:13:MX_TIM2_Init	3
+../Core/Src/main.c:490:13:MX_TIM3_Init	3
+../Core/Src/main.c:522:13:MX_USART3_UART_Init	2
+../Core/Src/main.c:540:13:MX_USB_OTG_FS_PCD_Init	2
+../Core/Src/main.c:558:13:MX_GPIO_Init	1
+../Core/Src/main.c:663:6:MPU_Config	1
+../Core/Src/main.c:685:6:Error_Handler	1

@@ -1,0 +1,22 @@
+{
+    "th_min": -137.43896484375,
+    "th_max": -118.377685546875,
+    "cl_min": -5.77880859375,
+    "cl_max": 12.864990234375,
+    "br_hall_min": -133.52783203125,
+    "br_hall_max": -128.792724609375,
+    "br_lc_min": -66418,
+    "br_lc_max": 717693,
+    "br_lc_trust": 0.5,
+    "rs_min": 1056964608,
+    "rs_max": 0,
+    "ls_min": -475,
+    "ls_max": 0,
+    "gear_col_left": 147.67541568750758,
+    "gear_col_right": 155.22893733971088,
+    "gear_row_top": -1067,
+    "gear_row_bot": 1016,
+    "h_sensor_mode": 0,
+    "ls_invert": 0,
+    "rs_invert": 0
+}
