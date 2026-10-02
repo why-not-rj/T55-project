@@ -1,0 +1,4 @@
+software/build/
+software/dist/
+*.exe
+*.pkg
